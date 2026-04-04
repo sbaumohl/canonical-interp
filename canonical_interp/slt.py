@@ -87,7 +87,7 @@ class LLCEstimator:
     def _normalize_devices(
         devs: List[str | t.device] | str | t.device,
     ) -> List[t.device]:
-        if isinstance(devs, List[str | t.device]):
+        if isinstance(devs, list):
             return [t.device(d) if isinstance(d, str) else d for d in devs]
         elif isinstance(devs, str):
             return [t.device(devs)]
@@ -112,7 +112,6 @@ class LLCEstimator:
         """
         Runs a batch of chains on a given device.
         """
-        # TODO figure out manual seeding
         if seed is not None:
             t.manual_seed(seed)
 
@@ -131,13 +130,13 @@ class LLCEstimator:
             randomness="different",
         )
 
-        original_loss = t.zeros((num_chains))
+        original_loss = t.zeros((num_chains), device=device)
         for batch in train_dataloader:
-            x, y = batch[0], batch[1]
+            x, y = batch[0].to(device=device), batch[1].to(device=device)
             _, loss = all_grad_fn(model, params, buffers, x, y)
             original_loss += loss
         original_loss /= len(train_dataloader)
-        self.original_loss[chain_idxs] = original_loss
+        self.original_loss[chain_idxs] = original_loss.cpu()
 
         initial_params = {name: p[0].clone() for name, p in params.items()}
 
@@ -146,7 +145,7 @@ class LLCEstimator:
             range(self.burnin_steps), range(self.grad_accumulation_steps)
         ):
             batch = next(data_iter)
-            x, y = batch[0], batch[1]
+            x, y = batch[0].to(device=device), batch[1].to(device=device)
             grads, _ = all_grad_fn(model, params, buffers, x, y)
             accumulated_grads = LLCEstimator._accumulate_grad(accumulated_grads, grads)
 
@@ -168,7 +167,7 @@ class LLCEstimator:
                 accumulated_grads = None
 
         # draw steps
-        cumulative_loss = t.zeros((num_chains))
+        cumulative_loss = t.zeros((num_chains), device=device)
         for draw_no in range(self.draws):
             for between_draw_count in range(self.steps_bw_draws):
                 accumulated_grads = None
@@ -176,7 +175,7 @@ class LLCEstimator:
 
                 for grad_step_count in range(self.grad_accumulation_steps):
                     batch = next(data_iter)
-                    x, y = batch[0], batch[1]
+                    x, y = batch[0].to(device=device), batch[1].to(device=device)
                     grads, losses = all_grad_fn(model, params, buffers, x, y)
                     accumulated_grads = LLCEstimator._accumulate_grad(
                         accumulated_grads, grads
@@ -198,7 +197,7 @@ class LLCEstimator:
                 )
 
             # TODO callback system
-            self.array_log_l[chain_idxs, draw_no] = cumulative_loss
+            self.array_log_l[chain_idxs, draw_no] = cumulative_loss.cpu()
             cumulative_loss.zero_()
 
     def estimate_llc(

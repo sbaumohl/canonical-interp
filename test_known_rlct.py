@@ -11,6 +11,8 @@ Usage:
     uv run python test_known_rlct.py
 """
 
+import time
+
 import torch as t
 import torch.nn as nn
 from torch.func import functional_call
@@ -74,7 +76,7 @@ def test_monomial_rlct():
             localization=2.0,
             nbeta=nbeta,
         )
-        llc = est.estimate_llc(model, loader, monomial_forward_loss, method="SGLD", seed=42)
+        llc = est.estimate_llc(model, loader, monomial_forward_loss, method="SGLD", seed=42, devices=[t.device("cuda")])
         mean_llc = llc.mean().item()
         true_rlct = 1.0 / (2 * k)
         results[k] = (mean_llc, true_rlct)
@@ -122,7 +124,7 @@ def test_monomial_rlct_devinterp():
             num_chains=10,
             num_burnin_steps=500,
             num_steps_bw_draws=1,
-            device="cpu",
+            device="cuda",
             seed=42,
             verbose=False,
         )
@@ -233,7 +235,7 @@ def test_reduced_rank_regression():
             localization=10.0,
             nbeta=nbeta,
         )
-        llc = est.estimate_llc(model, loader, rrr_forward_loss, method="SGLD", seed=42)
+        llc = est.estimate_llc(model, loader, rrr_forward_loss, method="SGLD", seed=42, devices=t.device("cuda"))
         mean_llc = llc.mean().item()
         true_rlct = true_rank * (H + K - true_rank) / 2.0
         results[true_rank] = (mean_llc, true_rlct)
@@ -295,7 +297,8 @@ def test_reduced_rank_regression_devinterp():
             num_chains=10,
             num_burnin_steps=500,
             num_steps_bw_draws=1,
-            device="cpu",
+            device="cuda",
+            cores=10,
             seed=42,
             verbose=False,
         )
@@ -398,26 +401,129 @@ def test_compare_accuracy():
 
 
 # =============================================================================
+# Speed benchmark
+# =============================================================================
+
+def _make_rrr_model_and_loader(H, K, r_max, true_rank, n_samples, batch_size):
+    """Helper: build a FactoredLinearMap + loader for benchmarking."""
+    x_data, y_data, _, A_true, B_true = make_rrr_data(
+        H, K, true_rank, n_samples=n_samples
+    )
+    loader = DataLoader(
+        TensorDataset(x_data, y_data), batch_size=batch_size, shuffle=False
+    )
+    model = FactoredLinearMap(K, H, r_max)
+    with t.no_grad():
+        model.A.zero_()
+        model.B.zero_()
+        model.A[:, :true_rank] = A_true
+        model.B[:true_rank, :] = B_true
+    return model, loader
+
+
+def test_speed():
+    """Benchmark ours (vmap) vs devinterp (multiprocessing) across model sizes.
+
+    All runs use the same draws, chains, burnin, and hyperparameters.
+    devinterp uses cores = num_chains // 2.
+    """
+    configs = [
+        # (label, H, K, r_max, true_rank, n_samples, batch_size)
+        ("tiny  (3x3,  r=1)", 3, 3, 3, 1, 1024, 1024),
+        ("small (5x5,  r=2)", 5, 5, 5, 2, 2048, 1024),
+        ("med   (10x10,r=3)", 10, 10, 10, 3, 4096, 1024),
+        ("large (20x20,r=5)", 20, 20, 20, 5, 4096, 1024),
+    ]
+    num_draws = 5000
+    num_chains = 10
+    burnin = 500
+    lr = 1e-5
+    loc = 10.0
+    di_cores = num_chains // 2
+
+    header = f"  {'config':<22} {'ours (s)':>10} {'devinterp (s)':>14} {'speedup':>8}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    for label, H, K, r_max, true_rank, n_samples, batch_size in configs:
+        nbeta = n_samples / t.tensor(float(n_samples)).log().item()
+
+        # --- Ours (vmap) ---
+        model_ours, loader = _make_rrr_model_and_loader(
+            H, K, r_max, true_rank, n_samples, batch_size
+        )
+        est = LLCEstimator(
+            draws=num_draws,
+            chains=num_chains,
+            burnin_steps=burnin,
+            steps_bw_draws=1,
+            learning_rate=lr,
+            localization=loc,
+            nbeta=nbeta,
+        )
+        t.cuda.synchronize()
+        t0 = time.perf_counter()
+        est.estimate_llc(
+            model_ours, loader, rrr_forward_loss, method="SGLD", seed=42,
+            devices="cuda",
+        )
+        t.cuda.synchronize()
+        ours_time = time.perf_counter() - t0
+
+        # --- devinterp (multiprocessing, GPU) ---
+        model_di, loader_di = _make_rrr_model_and_loader(
+            H, K, r_max, true_rank, n_samples, batch_size
+        )
+        t.cuda.synchronize()
+        t0 = time.perf_counter()
+        estimate_learning_coeff_with_summary(
+            model_di,
+            loader_di,
+            evaluate=evaluate_rrr_mse,
+            sampling_method=SGLD,
+            optimizer_kwargs=dict(lr=lr, localization=loc, nbeta=nbeta),
+            num_draws=num_draws,
+            num_chains=num_chains,
+            num_burnin_steps=burnin,
+            num_steps_bw_draws=1,
+            cores=di_cores,
+            device="cuda",
+            seed=42,
+            verbose=False,
+        )
+        t.cuda.synchronize()
+        di_time = time.perf_counter() - t0
+
+        speedup = di_time / ours_time if ours_time > 0 else float("inf")
+        print(f"  {label:<22} {ours_time:>10.2f} {di_time:>14.2f} {speedup:>7.1f}x")
+
+    print()
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
 def main():
-    print("=== Test: Monomial RLCT — ours ===")
-    test_monomial_rlct()
+    # print("=== Test: Monomial RLCT — ours ===")
+    # test_monomial_rlct()
+    #
+    # print("\n=== Test: Monomial RLCT — devinterp ===")
+    # test_monomial_rlct_devinterp()
+    #
+    # print("\n=== Test: Reduced Rank Regression — ours ===")
+    # test_reduced_rank_regression()
+    #
+    # print("\n=== Test: Reduced Rank Regression — devinterp ===")
+    # test_reduced_rank_regression_devinterp()
+    #
+    # print("\n=== Accuracy comparison (ours vs devinterp vs ground truth) ===")
+    # test_compare_accuracy()
 
-    print("\n=== Test: Monomial RLCT — devinterp ===")
-    test_monomial_rlct_devinterp()
+    print("\n=== Speed benchmark: ours (vmap) vs devinterp (multiprocessing) ===")
+    test_speed()
 
-    print("\n=== Test: Reduced Rank Regression — ours ===")
-    test_reduced_rank_regression()
-
-    print("\n=== Test: Reduced Rank Regression — devinterp ===")
-    test_reduced_rank_regression_devinterp()
-
-    print("\n=== Accuracy comparison (ours vs devinterp vs ground truth) ===")
-    test_compare_accuracy()
-
-    print("\n=== ALL KNOWN-RLCT TESTS PASSED ===")
+    print("=== ALL KNOWN-RLCT TESTS PASSED ===")
 
 
 if __name__ == "__main__":
