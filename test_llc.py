@@ -14,7 +14,6 @@ import torch.nn.functional as F
 from torch.func import functional_call
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
-import numpy as np
 
 from canonical_interp.slt import LLCEstimator
 from devinterp.slt.sampler import estimate_learning_coeff_with_summary
@@ -53,12 +52,11 @@ class MNISTNet(nn.Module):
 
 # -- forward_loss for our vmapped estimator ------------------------------------
 
-def forward_loss(model, params, buffers, batch):
-    """Pure function: (model, params, buffers, batch) -> scalar loss.
+def forward_loss(model, params, buffers, x, y):
+    """Pure function: (model, params, buffers, x, y) -> scalar loss.
 
     Uses functional_call so vmap can vectorize across stacked chain params.
     """
-    x, y = batch
     logits = functional_call(model, (params, buffers), (x.view(-1, 28 * 28),))
     return F.cross_entropy(logits, y)
 
@@ -262,10 +260,10 @@ def main():
     )
 
     # Use a small subset for tractable CPU testing
-    subset_size = 2000
+    subset_size = 10_000
     train_subset = Subset(train_dataset, range(subset_size))
 
-    batch_size = 256
+    batch_size = 1024
     train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
 
     nbeta = default_nbeta(train_loader)
@@ -274,7 +272,7 @@ def main():
     # Train model
     print("\nTraining MNISTNet...")
     model = MNISTNet(hidden_layer_sizes=[256, 256])  # smaller for CPU speed
-    model = train_model(model, train_loader, epochs=5, lr=0.05, device=device)
+    model = train_model(model, train_loader, epochs=10, lr=0.05, device=device)
     model = model.to("cpu")  # ensure everything is on CPU for functional transforms
     model.eval()
 

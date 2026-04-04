@@ -6,10 +6,13 @@ from torch.func import (
 )
 from copy import deepcopy
 from torch.utils.data import DataLoader
-from typing import Literal, Callable, Any
+from typing import Literal, Callable, List
 import torch.nn as nn
 import torch as t
 from itertools import cycle, product
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class LLCEstimator:
@@ -49,6 +52,7 @@ class LLCEstimator:
         learning_rate: float | int = 1.0,  # epsilon
         localization: float | int = 1.0,  # gamma
         nbeta: float | int = 4.0,
+        dtype: t.dtype = t.float32
     ):
         self.draws: int = draws
         self.chains: int = chains
@@ -61,6 +65,10 @@ class LLCEstimator:
         self.localization = localization
         self.nbeta = nbeta
 
+        self.preferred_dtype = dtype
+
+        # internal state for holding mid-run llc data
+
     @staticmethod
     def _accumulate_grad(
         current: dict[str, t.Tensor] | None, new: dict[str, t.Tensor]
@@ -71,15 +79,47 @@ class LLCEstimator:
         for name in new.keys():
             current[name].add_(new[name])
         return current
+    
+    @staticmethod
+    def _normalize_devices(devs: List[str | t.device] | str | t.device) -> List[t.device]:
+        if isinstance(devs, List[str | t.device]):
+            return [t.device(d) if isinstance(d, str) else d for d in devs] 
+        elif isinstance(devs, str):
+            return [t.device(devs)]
+        elif isinstance(devs, t.device):
+            return [devs]
+        else:
+            raise TypeError(f"`devices` is an unexpected type! Got {type(devs)}")
+
+
+    def _estimate_llc(
+        self,
+        model: nn.Module,
+        train_dataloader: DataLoader,
+        forward_loss: Callable[
+            [nn.Module, dict[str, t.Tensor], dict[str, t.Tensor], t.Tensor, t.Tensor],
+            t.Tensor], 
+        method: Literal["SGLD", "SGMCMC"],
+        chain_idxs: list[int],
+        device: str | t.device = t.device("cpu"),
+        seed=None
+    ):
+        """
+        Runs a batch of chains on a given device.
+        """
+        pass
 
     def estimate_llc(
         self,
         model: nn.Module,
         train_dataloader: DataLoader,
         forward_loss: Callable[
-            [nn.Module, dict[str, t.Tensor], dict[str, t.Tensor], Any], t.Tensor
+            [nn.Module, dict[str, t.Tensor], dict[str, t.Tensor], t.Tensor, t.Tensor],
+            t.Tensor,
         ],
         method: Literal["SGLD", "SGMCMC"],
+        chain_batch: int | Literal["all", "auto"] = "all",
+        devices: list[str | t.device] | str | t.device = t.device("cpu"),
         seed=None,
     ):
         """Run SGLD sampling and return per-chain LLC estimates.
@@ -87,9 +127,10 @@ class LLCEstimator:
         Args:
             model: Template module for functional_call (not modified).
             train_dataloader: Training data; cycled during sampling.
-            forward_loss: Pure function (model, params, buffers, batch) -> scalar loss.
+            forward_loss: Pure function (model, params, buffers, x, y) -> scalar loss.
                 Must use torch.func.functional_call internally so vmap can
-                vectorize over stacked chain parameters.
+                vectorize over stacked chain parameters. Inputs x and y are
+                unpacked from the DataLoader batch.
             method: Sampling method (currently only "SGLD" is implemented).
             seed: Optional RNG seed for reproducibility.
 
@@ -98,6 +139,11 @@ class LLCEstimator:
         """
         if seed is not None:
             t.manual_seed(seed)
+        
+        devices = LLCEstimator._normalize_devices(devices)
+
+        if self.preferred_dtype != t.float32 and any([not t.amp.autocast_mode.is_autocast_available(d.type) for d in devices]):
+            logger.warning(f"Not all devices support AMP. Will use AMP to autocast to {self.preferred_dtype} onl on devices for which AMP is available.")
 
         models = [deepcopy(model) for _ in range(self.chains)]
         params, buffers = stack_module_state(models)
@@ -108,12 +154,14 @@ class LLCEstimator:
         data_iter = cycle(train_dataloader)
         accumulated_grads = None
         all_grad_fn = vmap(
-            functional_grad_and_value(forward_loss), in_dims=(None, 0, 0, None)
+            functional_grad_and_value(forward_loss, argnums=1),
+            in_dims=(None, 0, 0, None, None),
         )
 
         original_loss = t.zeros((self.chains))
         for batch in train_dataloader:
-            _, loss = all_grad_fn(model, params, buffers, batch)
+            x, y = batch[0], batch[1]
+            _, loss = all_grad_fn(model, params, buffers, x, y)
             original_loss += loss
         original_loss /= len(train_dataloader)
 
@@ -124,7 +172,8 @@ class LLCEstimator:
             range(self.burnin_steps), range(self.grad_accumulation_steps)
         ):
             batch = next(data_iter)
-            grads, _ = all_grad_fn(model, params, buffers, batch)
+            x, y = batch[0], batch[1]
+            grads, _ = all_grad_fn(model, params, buffers, x, y)
             accumulated_grads = LLCEstimator._accumulate_grad(accumulated_grads, grads)
 
             is_grad_step = grad_step_count == self.grad_accumulation_steps - 1
@@ -153,7 +202,8 @@ class LLCEstimator:
 
                 for grad_step_count in range(self.grad_accumulation_steps):
                     batch = next(data_iter)
-                    grads, losses = all_grad_fn(model, params, buffers, batch)
+                    x, y = batch[0], batch[1]
+                    grads, losses = all_grad_fn(model, params, buffers, x, y)
                     accumulated_grads = LLCEstimator._accumulate_grad(
                         accumulated_grads, grads
                     )
