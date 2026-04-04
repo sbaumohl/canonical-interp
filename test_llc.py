@@ -210,10 +210,9 @@ def test_loss_trace_is_finite(model, loader, nbeta):
         localization=100.0,
         nbeta=nbeta,
     )
-    # Access the internal trace by running a quick estimator
-    # Temporarily monkey-patch to capture array_log_l isn't clean, so we
-    # verify indirectly: if the trace had NaN/inf, llc would be NaN/inf.
     llc = est.estimate_llc(model, loader, forward_loss, method="SGLD", seed=42)
+    assert t.isfinite(est.array_log_l).all(), f"Loss trace contains non-finite values: {est.array_log_l}"
+    assert (est.array_log_l > 0).all(), f"Loss trace should be positive for a trained model: {est.array_log_l}"
     assert t.isfinite(llc).all(), f"LLC contains non-finite values: {llc}"
     assert (llc > 0).all(), f"LLC should be positive for a trained model: {llc}"
     print(f"  LLC values: {llc.tolist()}")

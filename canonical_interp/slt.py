@@ -1,3 +1,6 @@
+import functools
+from concurrent.futures import ThreadPoolExecutor
+import math
 from canonical_interp.optim import sgld_step
 from torch.func import (
     stack_module_state,
@@ -9,7 +12,7 @@ from torch.utils.data import DataLoader
 from typing import Literal, Callable, List
 import torch.nn as nn
 import torch as t
-from itertools import cycle, product
+from itertools import cycle, product, batched
 import logging
 
 logger = logging.getLogger(__name__)
@@ -52,7 +55,7 @@ class LLCEstimator:
         learning_rate: float | int = 1.0,  # epsilon
         localization: float | int = 1.0,  # gamma
         nbeta: float | int = 4.0,
-        dtype: t.dtype = t.float32
+        dtype: t.dtype = t.float32,
     ):
         self.draws: int = draws
         self.chains: int = chains
@@ -79,11 +82,13 @@ class LLCEstimator:
         for name in new.keys():
             current[name].add_(new[name])
         return current
-    
+
     @staticmethod
-    def _normalize_devices(devs: List[str | t.device] | str | t.device) -> List[t.device]:
+    def _normalize_devices(
+        devs: List[str | t.device] | str | t.device,
+    ) -> List[t.device]:
         if isinstance(devs, List[str | t.device]):
-            return [t.device(d) if isinstance(d, str) else d for d in devs] 
+            return [t.device(d) if isinstance(d, str) else d for d in devs]
         elif isinstance(devs, str):
             return [t.device(devs)]
         elif isinstance(devs, t.device):
@@ -91,25 +96,7 @@ class LLCEstimator:
         else:
             raise TypeError(f"`devices` is an unexpected type! Got {type(devs)}")
 
-
     def _estimate_llc(
-        self,
-        model: nn.Module,
-        train_dataloader: DataLoader,
-        forward_loss: Callable[
-            [nn.Module, dict[str, t.Tensor], dict[str, t.Tensor], t.Tensor, t.Tensor],
-            t.Tensor], 
-        method: Literal["SGLD", "SGMCMC"],
-        chain_idxs: list[int],
-        device: str | t.device = t.device("cpu"),
-        seed=None
-    ):
-        """
-        Runs a batch of chains on a given device.
-        """
-        pass
-
-    def estimate_llc(
         self,
         model: nn.Module,
         train_dataloader: DataLoader,
@@ -118,36 +105,21 @@ class LLCEstimator:
             t.Tensor,
         ],
         method: Literal["SGLD", "SGMCMC"],
-        chain_batch: int | Literal["all", "auto"] = "all",
-        devices: list[str | t.device] | str | t.device = t.device("cpu"),
+        chain_idxs: list[int],
+        device: str | t.device = t.device("cpu"),
         seed=None,
     ):
-        """Run SGLD sampling and return per-chain LLC estimates.
-
-        Args:
-            model: Template module for functional_call (not modified).
-            train_dataloader: Training data; cycled during sampling.
-            forward_loss: Pure function (model, params, buffers, x, y) -> scalar loss.
-                Must use torch.func.functional_call internally so vmap can
-                vectorize over stacked chain parameters. Inputs x and y are
-                unpacked from the DataLoader batch.
-            method: Sampling method (currently only "SGLD" is implemented).
-            seed: Optional RNG seed for reproducibility.
-
-        Returns:
-            Tensor of shape (chains,) with per-chain LLC estimates.
         """
+        Runs a batch of chains on a given device.
+        """
+        # TODO figure out manual seeding
         if seed is not None:
             t.manual_seed(seed)
-        
-        devices = LLCEstimator._normalize_devices(devices)
 
-        if self.preferred_dtype != t.float32 and any([not t.amp.autocast_mode.is_autocast_available(d.type) for d in devices]):
-            logger.warning(f"Not all devices support AMP. Will use AMP to autocast to {self.preferred_dtype} onl on devices for which AMP is available.")
+        num_chains = len(chain_idxs)
 
-        models = [deepcopy(model) for _ in range(self.chains)]
+        models = [deepcopy(model).to(device=device) for _ in range(num_chains)]
         params, buffers = stack_module_state(models)
-        array_log_l = t.zeros((self.chains, self.draws))
 
         # We're abstracting the number of parallel chains away. Pretend we're running a single chain and let pytorch handle the parallel work
 
@@ -156,14 +128,16 @@ class LLCEstimator:
         all_grad_fn = vmap(
             functional_grad_and_value(forward_loss, argnums=1),
             in_dims=(None, 0, 0, None, None),
+            randomness="different",
         )
 
-        original_loss = t.zeros((self.chains))
+        original_loss = t.zeros((num_chains))
         for batch in train_dataloader:
             x, y = batch[0], batch[1]
             _, loss = all_grad_fn(model, params, buffers, x, y)
             original_loss += loss
         original_loss /= len(train_dataloader)
+        self.original_loss[chain_idxs] = original_loss
 
         initial_params = {name: p[0].clone() for name, p in params.items()}
 
@@ -194,7 +168,7 @@ class LLCEstimator:
                 accumulated_grads = None
 
         # draw steps
-        cumulative_loss = t.zeros((self.chains))
+        cumulative_loss = t.zeros((num_chains))
         for draw_no in range(self.draws):
             for between_draw_count in range(self.steps_bw_draws):
                 accumulated_grads = None
@@ -224,11 +198,95 @@ class LLCEstimator:
                 )
 
             # TODO callback system
-            array_log_l[:, draw_no] = cumulative_loss
+            self.array_log_l[chain_idxs, draw_no] = cumulative_loss
             cumulative_loss.zero_()
 
-        avg_sampled_loss = t.mean(array_log_l, dim=-1)
-        llc = self.nbeta * (avg_sampled_loss - original_loss)
+    def estimate_llc(
+        self,
+        model: nn.Module,
+        train_dataloader: DataLoader,
+        forward_loss: Callable[
+            [nn.Module, dict[str, t.Tensor], dict[str, t.Tensor], t.Tensor, t.Tensor],
+            t.Tensor,
+        ],
+        method: Literal["SGLD", "SGMCMC"],
+        chain_batch: int | Literal["all"] = "all",
+        devices: list[str | t.device] | str | t.device = t.device("cpu"),
+        seed=None,
+    ):
+        """Run SGLD sampling and return per-chain LLC estimates.
 
-        return llc
+        Args:
+            model: Template module for functional_call (not modified).
+            train_dataloader: Training data; cycled during sampling.
+            forward_loss: Pure function (model, params, buffers, x, y) -> scalar loss.
+                Must use torch.func.functional_call internally so vmap can
+                vectorize over stacked chain parameters. Inputs x and y are
+                unpacked from the DataLoader batch.
+            method: Sampling method (currently only "SGLD" is implemented).
+            seed: Optional RNG seed for reproducibility.
 
+        Returns:
+            Tensor of shape (chains,) with per-chain LLC estimates.
+        """
+
+        device_list = LLCEstimator._normalize_devices(devices)
+        if chain_batch == "all":
+            chain_batch = self.chains
+        num_chain_batches = math.ceil(float(self.chains) / float(chain_batch))
+
+        # master seed -> per-call seed -> reproducible results
+        seeds = [None] * num_chain_batches
+        if seed is not None:
+            rng = t.Generator()
+            rng.manual_seed(seed)
+            seeds = t.randint(0, 2**31, (num_chain_batches,), generator=rng).tolist()
+
+        if len(device_list) > num_chain_batches:
+            logger.warning(
+                f"More devices ({len(device_list)}) than chain batches ({chain_batch}). The first {chain_batch} devices will be used."
+            )
+
+        if self.preferred_dtype != t.float32 and any(
+            [not t.amp.autocast_mode.is_autocast_available(d.type) for d in device_list]
+        ):
+            logger.warning(
+                f"Not all devices support AMP. Will use AMP to autocast to {self.preferred_dtype} only on devices for which AMP is available."
+            )
+
+        self.array_log_l = t.zeros((self.chains, self.draws))
+        self.original_loss = t.zeros((self.chains,))
+
+        if num_chain_batches == 1:
+            self._estimate_llc(
+                model,
+                train_dataloader,
+                forward_loss,
+                method,
+                list(range(self.chains)),
+                device=device_list[0],
+                seed=seeds[0],
+            )
+        else:
+            partial_chain_call = functools.partial(
+                self._estimate_llc, model, train_dataloader, forward_loss, method
+            )
+
+            chains_device_iter = zip(
+                map(list, batched(range(self.chains), chain_batch)), cycle(device_list)
+            )  # (chain_idxs, t.device)
+
+            with ThreadPoolExecutor(max_workers=len(device_list)) as executor:
+                seed_idx = 0
+                for chain_idxs, device in chains_device_iter:
+                    executor.submit(
+                        lambda idxs, device: partial_chain_call(
+                            idxs, device=device, seed=seeds[seed_idx]
+                        ),
+                        chain_idxs,
+                        device,
+                    )
+                    seed_idx += 1
+
+        avg_sampled_loss = t.mean(self.array_log_l, dim=-1)
+        return self.nbeta * (avg_sampled_loss - self.original_loss)
