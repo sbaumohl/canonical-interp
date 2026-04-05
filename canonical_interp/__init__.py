@@ -1,3 +1,4 @@
-from canonical_interp import slt, optim
+from canonical_interp.slt import LLCEstimator
+from canonical_interp.optim import sgld_step
 
-__all__ = ["slt", "optim"]
+__all__ = ["LLCEstimator", "sgld_step"]

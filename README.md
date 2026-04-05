@@ -4,11 +4,11 @@ A lean, efficient Local Learning Coefficient (LLC / RLCT) estimator. Rewrite of 
 
 ## What is the LLC?
 
-The Local Learning Coefficient is a measure of effective model complexity at a specific point in weight space, grounded in Singular Learning Theory. For a model trained to a loss minimum $w^*$, the LLC estimates the real log canonical threshold (RLCT) $\hat\lambda$:
+The Local Learning Coefficient is a measure of effective model complexity at a specific point in weight space, grounded in Singular Learning Theory. For a model trained to a loss minimum $w^{\ast}$, the LLC estimates the real log canonical threshold (RLCT) $\hat\lambda$:
 
 $$\hat\lambda = n\beta \cdot (\bar L_{\text{SGLD}} - L_0)$$
 
-where $L_0$ is the loss at $w^*$, $\bar L_{\text{SGLD}}$ is the time-averaged loss of SGLD chains run from $w^*$, and $n\beta$ is an inverse-temperature factor. Higher LLC means the model is using more of its parameter space at that point — lower LLC signals degeneracy or symmetry.
+where $L_0$ is the loss at $w^{\ast}$, $\bar L_{\text{SGLD}}$ is the time-averaged loss of SGLD chains run from $w^{\ast}$, and $n\beta$ is an inverse-temperature factor. Higher LLC means the model is using more of its parameter space at that point — lower LLC signals degeneracy or symmetry.
 
 ## Installation
 
@@ -147,7 +147,7 @@ loader = DataLoader(
 |---|---|---|
 | `nbeta` | `n / log(n)` | Inverse temperature; scales the LLC estimate. Use `devinterp.utils.default_nbeta` or compute directly. |
 | `learning_rate` | `1e-6` – `1e-4` | SGLD step size. Too large → divergence; too small → chain doesn't move. |
-| `localization` | `1` – `1000` | Elastic pull toward initial weights. Higher values keep chains near $w^*$, giving tighter LLC estimates. |
+| `localization` | `1` – `1000` | Elastic pull toward initial weights. Higher values keep chains near $w^{\ast}$, giving tighter LLC estimates. |
 | `burnin_steps` | 100 – 500 | Steps discarded before draws. Should cover transient behaviour. |
 | `draws` | 100 – 500 | Samples per chain used to estimate $\bar L$. More draws → lower variance. |
 | `chains` | 5 – 20 | Independent chains. More chains → lower variance; all run in parallel via vmap. |
