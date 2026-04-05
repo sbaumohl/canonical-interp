@@ -1,4 +1,3 @@
-import functools
 from concurrent.futures import ThreadPoolExecutor
 import math
 from canonical_interp.optim import sgld_step
@@ -6,13 +5,16 @@ from torch.func import (
     stack_module_state,
     vmap,
     grad_and_value as functional_grad_and_value,
+    functional_call,
 )
 from copy import deepcopy
 from torch.utils.data import DataLoader
-from typing import Literal, Callable, List
+from typing import Literal, Callable, List, Tuple
 import torch.nn as nn
 import torch as t
+import torch.nn.functional as F
 from itertools import cycle, product, batched
+from functools import partial
 import logging
 
 logger = logging.getLogger(__name__)
@@ -96,43 +98,112 @@ class LLCEstimator:
         else:
             raise TypeError(f"`devices` is an unexpected type! Got {type(devs)}")
 
+    @staticmethod
+    def _construct_forward_pass(
+        criterion_fn: Callable[[t.Tensor, t.Tensor], t.Tensor],
+    ) -> Callable[
+        [nn.Module, dict[str, t.Tensor], dict[str, t.Tensor], t.Tensor, t.Tensor],
+        t.Tensor,
+    ]:
+        """Wrap a user-supplied criterion into the signature required by vmap.
+
+        ``vmap`` needs a pure function with explicit ``params`` and ``buffers``
+        arguments so it can vectorize over stacked chain states.  This helper
+        lets callers supply a simple ``criterion_fn(logits, y) -> scalar``
+        instead of writing the ``functional_call`` boilerplate themselves.
+
+        Args:
+            criterion_fn: Loss function taking ``(logits, targets)`` and
+                returning a scalar tensor.
+
+        Returns:
+            A pure function ``(model, params, buffers, x, y) -> scalar`` that
+            runs a forward pass via :func:`~torch.func.functional_call` and
+            then applies ``criterion_fn``.
+        """
+
+        def wrapped_forward(
+            model: nn.Module,
+            params: dict[str, t.Tensor],
+            buffers: dict[str, t.Tensor],
+            x: t.Tensor,
+            y: t.Tensor,
+        ) -> t.Tensor:
+            return criterion_fn(functional_call(model, (params, buffers), (x,)), y)
+
+        return wrapped_forward
+
     def _estimate_llc(
         self,
         model: nn.Module,
         train_dataloader: DataLoader,
-        forward_loss: Callable[
+        forward_pass: Callable[
             [nn.Module, dict[str, t.Tensor], dict[str, t.Tensor], t.Tensor, t.Tensor],
             t.Tensor,
         ],
-        method: Literal["SGLD", "SGMCMC"],
+        unpack_fn: Callable[..., Tuple[t.Tensor, t.Tensor]],
         chain_idxs: list[int],
-        device: str | t.device = t.device("cpu"),
+        device: t.device = t.device("cpu"),
         seed=None,
+        compile: bool = True,
     ):
-        """
-        Runs a batch of chains on a given device.
+        """Run a batch of SGLD chains on a single device and record loss draws.
+
+        Results are written directly into ``self.array_log_l`` and
+        ``self.original_loss`` at positions ``chain_idxs``.
+
+        Args:
+            model: Template module used by ``functional_call``; not modified.
+            train_dataloader: Data source; cycled throughout sampling.
+            forward_pass: Pure ``(model, params, buffers, x, y) -> scalar``
+                function, typically produced by :meth:`_construct_forward_pass`.
+            unpack_fn: Extracts ``(x, y)`` from a raw dataloader batch.
+                Device movement is handled internally; this function should
+                only perform extraction and any necessary preprocessing.
+            chain_idxs: Indices into the global chain arrays that this call
+                is responsible for.
+            device: Device on which to run all computation for these chains.
+            seed: Optional RNG seed for reproducibility on this device.
+            compile: If True, JIT-compile the vmapped grad function with
+                ``torch.compile``.
         """
         if seed is not None:
             t.manual_seed(seed)
 
         num_chains = len(chain_idxs)
 
-        models = [deepcopy(model).to(device=device) for _ in range(num_chains)]
+        moved_model = model.to(device=device)
+        models = [deepcopy(moved_model) for _ in range(num_chains)]
         params, buffers = stack_module_state(models)
+        del models
+
+        # Autocast must wrap the function *before* vmap/grad see it so the
+        # dtype cast is part of the function graph all three transforms operate on.
+        if (
+            self.preferred_dtype != t.float32
+            and t.amp.autocast_mode.is_autocast_available(device.type)
+        ):
+            _fp = forward_pass
+            def forward_pass(model, params, buffers, x, y):
+                with t.amp.autocast(device_type=device.type, dtype=self.preferred_dtype):
+                    return _fp(model, params, buffers, x, y)
 
         # We're abstracting the number of parallel chains away. Pretend we're running a single chain and let pytorch handle the parallel work
-
         data_iter = cycle(train_dataloader)
         accumulated_grads = None
         all_grad_fn = vmap(
-            functional_grad_and_value(forward_loss, argnums=1),
+            functional_grad_and_value(forward_pass, argnums=1),
             in_dims=(None, 0, 0, None, None),
             randomness="different",
         )
 
+        if compile:
+            all_grad_fn = t.compile(all_grad_fn)
+
         original_loss = t.zeros((num_chains), device=device)
         for batch in train_dataloader:
-            x, y = batch[0].to(device=device), batch[1].to(device=device)
+            x, y = unpack_fn(batch)
+            x, y = x.to(device=device), y.to(device=device)
             _, loss = all_grad_fn(model, params, buffers, x, y)
             original_loss += loss
         original_loss /= len(train_dataloader)
@@ -145,7 +216,8 @@ class LLCEstimator:
             range(self.burnin_steps), range(self.grad_accumulation_steps)
         ):
             batch = next(data_iter)
-            x, y = batch[0].to(device=device), batch[1].to(device=device)
+            x, y = unpack_fn(batch)
+            x, y = x.to(device=device), y.to(device=device)
             grads, _ = all_grad_fn(model, params, buffers, x, y)
             accumulated_grads = LLCEstimator._accumulate_grad(accumulated_grads, grads)
 
@@ -175,7 +247,8 @@ class LLCEstimator:
 
                 for grad_step_count in range(self.grad_accumulation_steps):
                     batch = next(data_iter)
-                    x, y = batch[0].to(device=device), batch[1].to(device=device)
+                    x, y = unpack_fn(batch)
+                    x, y = x.to(device=device), y.to(device=device)
                     grads, losses = all_grad_fn(model, params, buffers, x, y)
                     accumulated_grads = LLCEstimator._accumulate_grad(
                         accumulated_grads, grads
@@ -204,29 +277,45 @@ class LLCEstimator:
         self,
         model: nn.Module,
         train_dataloader: DataLoader,
-        forward_loss: Callable[
-            [nn.Module, dict[str, t.Tensor], dict[str, t.Tensor], t.Tensor, t.Tensor],
-            t.Tensor,
-        ],
-        method: Literal["SGLD", "SGMCMC"],
+        criterion_fn: Callable[[t.Tensor, t.Tensor], t.Tensor] = F.cross_entropy,
         chain_batch: int | Literal["all"] = "all",
         devices: list[str | t.device] | str | t.device = t.device("cpu"),
         seed=None,
+        compile: bool = True,
+        unpack_fn: Callable[..., Tuple[t.Tensor, t.Tensor]] | None = None,
+        cuda_alloc_conf: str | None = "expandable_segments:True",
     ):
         """Run SGLD sampling and return per-chain LLC estimates.
 
         Args:
-            model: Template module for functional_call (not modified).
-            train_dataloader: Training data; cycled during sampling.
-            forward_loss: Pure function (model, params, buffers, x, y) -> scalar loss.
-                Must use torch.func.functional_call internally so vmap can
-                vectorize over stacked chain parameters. Inputs x and y are
-                unpacked from the DataLoader batch.
-            method: Sampling method (currently only "SGLD" is implemented).
-            seed: Optional RNG seed for reproducibility.
+            model: Template module used by ``functional_call``; not modified.
+            train_dataloader: Training data source; cycled during sampling.
+            criterion_fn: Loss function ``(logits, targets) -> scalar``.
+                The library wraps this with ``functional_call`` internally,
+                so callers do *not* need to reference ``params`` or ``buffers``.
+            chain_batch: Number of chains to run per device call.  ``"all"``
+                (default) runs all chains in a single call on the first device.
+            devices: Device or list of devices to distribute chain batches
+                across.  Extra devices beyond the number of chain batches are
+                ignored with a warning.
+            seed: Optional integer seed for reproducible sampling.  Derived
+                per-call seeds are generated from this master seed.
+            compile: If True (default), JIT-compile the vmapped grad function
+                with ``torch.compile`` for faster sampling.
+            unpack_fn: Optional function ``(batch) -> (x, y)`` to extract
+                inputs and targets from a raw dataloader batch.  Defaults to
+                ``lambda batch: (batch[0], batch[1])``.  Device movement is
+                handled internally; this function should only extract and
+                preprocess data.
+            cuda_alloc_conf: Configuration string passed to
+                ``torch.cuda.memory._set_allocator_settings`` before sampling
+                on any CUDA device.  Defaults to
+                ``"expandable_segments:True"``, which reduces fragmentation
+                when tensor sizes vary across chains and batches.  Set to
+                ``None`` to leave the allocator unchanged.
 
         Returns:
-            Tensor of shape (chains,) with per-chain LLC estimates.
+            Tensor of shape ``(chains,)`` with per-chain LLC estimates.
         """
 
         device_list = LLCEstimator._normalize_devices(devices)
@@ -241,6 +330,10 @@ class LLCEstimator:
             rng.manual_seed(seed)
             seeds = t.randint(0, 2**31, (num_chain_batches,), generator=rng).tolist()
 
+        cuda_devices = [d for d in device_list if d.type == "cuda"]
+        if cuda_devices and cuda_alloc_conf is not None:
+            t._C._accelerator_setAllocatorSettings(cuda_alloc_conf)
+
         if len(device_list) > num_chain_batches:
             logger.warning(
                 f"More devices ({len(device_list)}) than chain batches ({chain_batch}). The first {chain_batch} devices will be used."
@@ -253,22 +346,48 @@ class LLCEstimator:
                 f"Not all devices support AMP. Will use AMP to autocast to {self.preferred_dtype} only on devices for which AMP is available."
             )
 
+        if not train_dataloader.pin_memory:
+            logger.warning(
+                "`train_dataloader` has `pin_memory=False`. Enabling pinned memory speeds up CPU-GPU data transfer."
+            )
+
+        if train_dataloader.num_workers == 0:
+            logger.warning(
+                "`train_dataloader` has `num_workers=0`. Increasing worker count reduces downtime between forward passes."
+            )
+
+        if train_dataloader.num_workers > 0 and not train_dataloader.persistent_workers:
+            logger.warning(
+                "`train_dataloader` has `persistent_workers=False`. With `num_workers > 0`, workers respawn between epochs — set `persistent_workers=True` to avoid repeated startup overhead during SGLD cycling."
+            )
+
         self.array_log_l = t.zeros((self.chains, self.draws))
         self.original_loss = t.zeros((self.chains,))
+
+        # prep backward/forward pass
+        forward_pass = LLCEstimator._construct_forward_pass(criterion_fn)
+        if unpack_fn is None:
+            unpack_fn = lambda batch: (batch[0], batch[1])
 
         if num_chain_batches == 1:
             self._estimate_llc(
                 model,
                 train_dataloader,
-                forward_loss,
-                method,
+                forward_pass,
+                unpack_fn,
                 list(range(self.chains)),
                 device=device_list[0],
                 seed=seeds[0],
+                compile=compile,
             )
         else:
-            partial_chain_call = functools.partial(
-                self._estimate_llc, model, train_dataloader, forward_loss, method
+            partial_chain_call = partial(
+                self._estimate_llc,
+                model,
+                train_dataloader,
+                forward_pass,
+                unpack_fn,
+                compile=compile,
             )
 
             chains_device_iter = zip(
@@ -276,16 +395,14 @@ class LLCEstimator:
             )  # (chain_idxs, t.device)
 
             with ThreadPoolExecutor(max_workers=len(device_list)) as executor:
-                seed_idx = 0
-                for chain_idxs, device in chains_device_iter:
+                for seed_idx, (chain_idxs, device) in enumerate(chains_device_iter):
                     executor.submit(
-                        lambda idxs, device: partial_chain_call(
-                            idxs, device=device, seed=seeds[seed_idx]
+                        lambda idxs, device, s=seeds[seed_idx]: partial_chain_call(
+                            idxs, device=device, seed=s
                         ),
                         chain_idxs,
                         device,
                     )
-                    seed_idx += 1
 
         avg_sampled_loss = t.mean(self.array_log_l, dim=-1)
         return self.nbeta * (avg_sampled_loss - self.original_loss)

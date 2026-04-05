@@ -11,7 +11,6 @@ Usage:
 import torch as t
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.func import functional_call
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
@@ -20,8 +19,8 @@ from devinterp.slt.sampler import estimate_learning_coeff_with_summary
 from devinterp.optim.sgld import SGLD
 from devinterp.utils import default_nbeta, evaluate_ce
 
-
 # -- Model (matches devinterp MNIST example) ----------------------------------
+
 
 class MNISTNet(nn.Module):
     def __init__(
@@ -50,18 +49,8 @@ class MNISTNet(nn.Module):
         return x
 
 
-# -- forward_loss for our vmapped estimator ------------------------------------
-
-def forward_loss(model, params, buffers, x, y):
-    """Pure function: (model, params, buffers, x, y) -> scalar loss.
-
-    Uses functional_call so vmap can vectorize across stacked chain params.
-    """
-    logits = functional_call(model, (params, buffers), (x.view(-1, 28 * 28),))
-    return F.cross_entropy(logits, y)
-
-
 # -- Training loop -------------------------------------------------------------
+
 
 def train_model(model, train_loader, epochs=10, lr=0.05, device="cpu"):
     model = model.to(device)
@@ -93,6 +82,7 @@ def train_model(model, train_loader, epochs=10, lr=0.05, device="cpu"):
 
 # -- Tests ---------------------------------------------------------------------
 
+
 def test_llc_positive(model, loader, nbeta):
     """LLC should be positive for a trained model (sampled loss > init loss)."""
     estimator = LLCEstimator(
@@ -104,7 +94,7 @@ def test_llc_positive(model, loader, nbeta):
         localization=100.0,
         nbeta=nbeta,
     )
-    llc = estimator.estimate_llc(model, loader, forward_loss, method="SGLD", seed=42)
+    llc = estimator.estimate_llc(model, loader, seed=42)
     print(f"  Per-chain LLC: {llc}")
     mean_llc = llc.mean().item()
     print(f"  Mean LLC: {mean_llc:.4f}")
@@ -125,8 +115,8 @@ def test_llc_deterministic(model, loader, nbeta):
         nbeta=nbeta,
     )
     est = LLCEstimator(**kwargs)
-    llc1 = est.estimate_llc(model, loader, forward_loss, method="SGLD", seed=42)
-    llc2 = est.estimate_llc(model, loader, forward_loss, method="SGLD", seed=42)
+    llc1 = est.estimate_llc(model, loader, seed=42)
+    llc2 = est.estimate_llc(model, loader, seed=42)
     diff = (llc1 - llc2).abs().max().item()
     print(f"  Max abs diff between runs: {diff:.2e}")
     assert diff < 1e-5, f"Same seed should give same LLC, got diff={diff}"
@@ -155,9 +145,11 @@ def test_compare_devinterp(model, loader, nbeta, device="cpu"):
         localization=loc,
         nbeta=nbeta,
     )
-    our_llc = est.estimate_llc(
-        model, loader, forward_loss, method="SGLD", seed=42
-    ).mean().item()
+    our_llc = (
+        est.estimate_llc(model, loader, seed=42)
+        .mean()
+        .item()
+    )
 
     # -- devinterp reference --
     di_results = estimate_learning_coeff_with_summary(
@@ -210,9 +202,13 @@ def test_loss_trace_is_finite(model, loader, nbeta):
         localization=100.0,
         nbeta=nbeta,
     )
-    llc = est.estimate_llc(model, loader, forward_loss, method="SGLD", seed=42)
-    assert t.isfinite(est.array_log_l).all(), f"Loss trace contains non-finite values: {est.array_log_l}"
-    assert (est.array_log_l > 0).all(), f"Loss trace should be positive for a trained model: {est.array_log_l}"
+    llc = est.estimate_llc(model, loader, seed=42)
+    assert t.isfinite(
+        est.array_log_l
+    ).all(), f"Loss trace contains non-finite values: {est.array_log_l}"
+    assert (
+        est.array_log_l > 0
+    ).all(), f"Loss trace should be positive for a trained model: {est.array_log_l}"
     assert t.isfinite(llc).all(), f"LLC contains non-finite values: {llc}"
     assert (llc > 0).all(), f"LLC should be positive for a trained model: {llc}"
     print(f"  LLC values: {llc.tolist()}")
@@ -232,7 +228,7 @@ def test_localization_keeps_llc_bounded(model, loader, nbeta):
             localization=loc,
             nbeta=nbeta,
         )
-        llc = est.estimate_llc(model, loader, forward_loss, method="SGLD", seed=42)
+        llc = est.estimate_llc(model, loader, seed=42)
         llcs[loc] = llc.mean().item()
         print(f"  localization={loc:>7.1f}  mean_llc={llcs[loc]:.4f}")
 
@@ -245,15 +241,18 @@ def test_localization_keeps_llc_bounded(model, loader, nbeta):
 
 # -- Main ----------------------------------------------------------------------
 
+
 def main():
     device = "cuda" if t.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
     # Load MNIST (use a subset for speed on CPU)
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),
-    ])
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,)),
+        ]
+    )
     train_dataset = datasets.MNIST(
         root="./data", train=True, download=True, transform=transform
     )
@@ -263,7 +262,9 @@ def main():
     train_subset = Subset(train_dataset, range(subset_size))
 
     batch_size = 1024
-    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
+    train_loader = DataLoader(
+        train_subset, batch_size=batch_size, shuffle=True, num_workers=4
+    )
 
     nbeta = default_nbeta(train_loader)
     print(f"nbeta (batch_size={batch_size}): {nbeta:.2f}")
@@ -276,7 +277,9 @@ def main():
     model.eval()
 
     # Use a non-shuffled loader for deterministic LLC estimation
-    eval_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=False)
+    eval_loader = DataLoader(
+        train_subset, batch_size=batch_size, shuffle=False, num_workers=4
+    )
 
     print("\n--- Test: LLC should be positive ---")
     test_llc_positive(model, eval_loader, nbeta)

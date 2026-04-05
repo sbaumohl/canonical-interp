@@ -1,6 +1,7 @@
 import torch as t
 
 
+@t.compile()
 @t.no_grad()
 def sgld_step(
     params: dict[str, t.Tensor],
@@ -10,7 +11,6 @@ def sgld_step(
     learning_rate: float = 1.0,
     nbeta: float = 1.0,
     localization: float = 0.0,
-    weight_decay: float = 0.0,
     noise_level: float = 1.0,
 ):
     """Perform a single Stochastic Gradient Langevin Dynamics (SGLD) update step in-place.
@@ -46,8 +46,6 @@ def sgld_step(
             set to ``n / ln(n)`` where *n* is the effective sample size.
         localization: Strength ``gamma`` of the elastic term that pulls
             parameters back toward ``initial_weights``.  Set to 0 to disable.
-        weight_decay: Standard L2 weight decay coefficient.  Set to 0 to
-            disable.
         noise_level: Standard deviation multiplier for the injected Gaussian
             noise (default 1.0).
     """
@@ -56,9 +54,6 @@ def sgld_step(
 
         if localization > 0.0:
             delta_weights += localization * (p - initial_weights[name])
-
-        if weight_decay > 0.0:
-            delta_weights += weight_decay * p
 
         noise = t.randn_like(p) * noise_level
 
