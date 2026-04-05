@@ -1,3 +1,4 @@
+import tqdm
 from concurrent.futures import ThreadPoolExecutor
 import math
 from canonical_interp.optim import sgld_step
@@ -144,6 +145,8 @@ class LLCEstimator:
         unpack_fn: Callable[..., Tuple[t.Tensor, t.Tensor]],
         chain_idxs: list[int],
         device: t.device = t.device("cpu"),
+        thread_idx: int | None = None,
+        show_progress: bool = True,
         seed=None,
         compile: bool = True,
     ):
@@ -163,6 +166,10 @@ class LLCEstimator:
             chain_idxs: Indices into the global chain arrays that this call
                 is responsible for.
             device: Device on which to run all computation for these chains.
+            thread_idx: Index of this thread in a multi-device run, used to
+                position tqdm bars so they don't overwrite each other.  ``None``
+                for single-batch runs.
+            show_progress: If True, display a tqdm progress bar.
             seed: Optional RNG seed for reproducibility on this device.
             compile: If True, JIT-compile the vmapped grad function with
                 ``torch.compile``.
@@ -184,8 +191,11 @@ class LLCEstimator:
             and t.amp.autocast_mode.is_autocast_available(device.type)
         ):
             _fp = forward_pass
+
             def forward_pass(model, params, buffers, x, y):
-                with t.amp.autocast(device_type=device.type, dtype=self.preferred_dtype):
+                with t.amp.autocast(
+                    device_type=device.type, dtype=self.preferred_dtype
+                ):
                     return _fp(model, params, buffers, x, y)
 
         # We're abstracting the number of parallel chains away. Pretend we're running a single chain and let pytorch handle the parallel work
@@ -210,6 +220,16 @@ class LLCEstimator:
         self.original_loss[chain_idxs] = original_loss.cpu()
 
         initial_params = {name: p[0].clone() for name, p in params.items()}
+
+        pbar = tqdm.tqdm(
+            leave=False,
+            dynamic_ncols=True,
+            disable=not show_progress,
+            total=(self.burnin_steps + self.draws * self.steps_bw_draws)
+            * self.grad_accumulation_steps,
+            position=thread_idx if thread_idx is not None else 0,
+            desc=f"Thread {thread_idx}" if thread_idx is not None else None,
+        )
 
         # burn-in steps
         for _, grad_step_count in product(
@@ -237,6 +257,7 @@ class LLCEstimator:
                     localization=self.localization,
                 )
                 accumulated_grads = None
+            pbar.update(1)
 
         # draw steps
         cumulative_loss = t.zeros((num_chains), device=device)
@@ -269,9 +290,13 @@ class LLCEstimator:
                     localization=self.localization,
                 )
 
+                pbar.update(self.grad_accumulation_steps)
+
             # TODO callback system
             self.array_log_l[chain_idxs, draw_no] = cumulative_loss.cpu()
             cumulative_loss.zero_()
+
+        pbar.close()
 
     def estimate_llc(
         self,
@@ -284,6 +309,7 @@ class LLCEstimator:
         compile: bool = True,
         unpack_fn: Callable[..., Tuple[t.Tensor, t.Tensor]] | None = None,
         cuda_alloc_conf: str | None = "expandable_segments:True",
+        show_progress: bool = True,
     ):
         """Run SGLD sampling and return per-chain LLC estimates.
 
@@ -313,6 +339,9 @@ class LLCEstimator:
                 ``"expandable_segments:True"``, which reduces fragmentation
                 when tensor sizes vary across chains and batches.  Set to
                 ``None`` to leave the allocator unchanged.
+            show_progress: If True (default), display a tqdm progress bar
+                tracking burn-in and draw steps.  In multi-device runs each
+                thread gets its own bar at a separate terminal position.
 
         Returns:
             Tensor of shape ``(chains,)`` with per-chain LLC estimates.
@@ -379,6 +408,7 @@ class LLCEstimator:
                 device=device_list[0],
                 seed=seeds[0],
                 compile=compile,
+                show_progress=show_progress,
             )
         else:
             partial_chain_call = partial(
@@ -388,6 +418,7 @@ class LLCEstimator:
                 forward_pass,
                 unpack_fn,
                 compile=compile,
+                show_progress=show_progress,
             )
 
             chains_device_iter = zip(
@@ -395,10 +426,12 @@ class LLCEstimator:
             )  # (chain_idxs, t.device)
 
             with ThreadPoolExecutor(max_workers=len(device_list)) as executor:
-                for seed_idx, (chain_idxs, device) in enumerate(chains_device_iter):
+                for thread_idx, (chain_idxs, device) in enumerate(chains_device_iter):
                     executor.submit(
-                        lambda idxs, device, s=seeds[seed_idx]: partial_chain_call(
-                            idxs, device=device, seed=s
+                        lambda idxs, device, t_idx=thread_idx, s=seeds[
+                            thread_idx
+                        ]: partial_chain_call(
+                            idxs, device=device, thread_idx=t_idx, seed=s
                         ),
                         chain_idxs,
                         device,

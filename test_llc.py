@@ -215,6 +215,32 @@ def test_loss_trace_is_finite(model, loader, nbeta):
     print("  PASSED: loss trace is finite and positive")
 
 
+def test_multithreaded_two_cuda_devices(model, loader, nbeta):
+    """Multi-device path doesn't deadlock and produces finite, positive LLC.
+
+    Uses ["cuda", "cuda"] as two fake devices with chain_batch=2 to force the
+    ThreadPoolExecutor path on a single GPU.
+    """
+    est = LLCEstimator(
+        draws=20,
+        chains=4,
+        burnin_steps=0,
+        steps_bw_draws=1,
+        learning_rate=1e-5,
+        localization=100.0,
+        nbeta=nbeta,
+    )
+    llc = est.estimate_llc(
+        model, loader, devices=["cuda", "cuda"], chain_batch=2, seed=42
+    )
+    assert llc.shape == (4,), f"Expected shape (4,), got {llc.shape}"
+    assert t.isfinite(llc).all(), f"LLC contains non-finite values: {llc}"
+    assert (llc > 0).all(), f"LLC should be positive for a trained model: {llc}"
+    print(f"  Per-chain LLC: {llc.tolist()}")
+    print(f"  Mean LLC: {llc.mean().item():.4f}")
+    print("  PASSED: multi-threaded CUDA run finished without errors")
+
+
 def test_localization_keeps_llc_bounded(model, loader, nbeta):
     """Higher localization should give lower LLC (tighter around init)."""
     llcs = {}
@@ -295,6 +321,10 @@ def main():
 
     print("\n--- Test: higher localization gives lower LLC ---")
     test_localization_keeps_llc_bounded(model, eval_loader, nbeta)
+
+    if t.cuda.is_available():
+        print("\n--- Test: multi-threaded two CUDA devices ---")
+        test_multithreaded_two_cuda_devices(model, eval_loader, nbeta)
 
     print("\n=== ALL TESTS PASSED ===")
 
