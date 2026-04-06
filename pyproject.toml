@@ -1,6 +1,6 @@
 [project]
 name = "canonical-interp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Efficient tooling for Developmental Interpretability"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,6 +13,11 @@ dependencies = [
 license = "MIT"
 authors = [
   { name="Sam Baumohl", email="sam@baumohl.dev" },
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
 ]
 
 [build-system]
