@@ -1,4 +1,8 @@
-# canonical-interp
+# Canonical Interp: Efficient Developmental Interpretability
+
+[![PyPI version](https://img.shields.io/pypi/v/canonical-interp)](https://pypi.org/project/canonical-interp/)
+
+> **Note:** This package is under active development (0.X.Y). Breaking changes should be expected between minor versions.
 
 A lean, efficient Local Learning Coefficient (LLC / RLCT) estimator. Rewrite of [Timaeus's `devinterp`](https://github.com/timaeus-research/devinterp). MIT licensed.
 

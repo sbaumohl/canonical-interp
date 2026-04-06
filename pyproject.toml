@@ -10,3 +10,15 @@ dependencies = [
     "torchvision>=0.26.0",
     "tqdm>=4.67.3",
 ]
+license = "MIT"
+authors = [
+  { name="Sam Baumohl", email="sam@baumohl.dev" },
+]
+
+[build-system]
+requires = ["uv_build >= 0.10.10, <0.11.0"]
+build-backend = "uv_build"
+
+[project.urls]
+Homepage = "https://github.com/sbaumohl/canonical-interp"
+Issues = "https://github.com/sbaumohl/canonical-interp/issues"
