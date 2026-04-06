@@ -74,6 +74,17 @@ class LLCEstimator:
         self.preferred_dtype = dtype
 
         # internal state for holding mid-run llc data
+        self._metrics = dict()
+
+        if self.burnin_steps < self.draws:
+            logger.warning(
+                "Designated fewer burn-in steps than draws. It is recommended to increase burn-in steps until we reach a loss plateau."
+            )
+
+        if 1.0 < self.localization < 10.0:
+            logger.warning(
+                f"Localization term is {self.localization}. It is recommended to avoid extreme localization parameters. Try lowering epsilon or increasing draws or burn-in steps."
+            )
 
     @staticmethod
     def _accumulate_grad(
@@ -133,6 +144,9 @@ class LLCEstimator:
             return criterion_fn(functional_call(model, (params, buffers), (x,)), y)
 
         return wrapped_forward
+
+    def get_metrics(self) -> dict[str, t.Tensor] | None:
+        return self._metrics
 
     def _estimate_llc(
         self,
@@ -358,7 +372,7 @@ class LLCEstimator:
             rng = t.Generator()
             rng.manual_seed(seed)
             seeds = t.randint(0, 2**31, (num_chain_batches,), generator=rng).tolist()
-        
+
         # This causes weird incompatibility, commenting out for now
         # cuda_devices = [d for d in device_list if d.type == "cuda"]
         # if cuda_devices and cuda_alloc_conf is not None:
@@ -439,4 +453,14 @@ class LLCEstimator:
                     )
 
         avg_sampled_loss = t.mean(self.array_log_l, dim=-1)
-        return self.nbeta * (avg_sampled_loss - self.original_loss)
+        llcs = self.nbeta * (avg_sampled_loss - self.original_loss)
+        mean_llc = llcs.mean()
+        self._metrics = dict(
+            llcs=llcs,  # [chains] : llc estimate for each chain
+            llc_mean=mean_llc,  # avg llc, our lambda-hat true LLC estimate
+            llc_std=llcs.std(),  # std of llc estimates
+            losses=self.array_log_l.clone(),  # [chains, draws] : full loss trace
+            losses_mean=self.array_log_l[:, -1].mean(),
+            losses_std=self.array_log_l[:, -1].std(),
+        )
+        return mean_llc

@@ -34,8 +34,9 @@ class TestOutputShape:
         )
         llc = est.estimate_llc(trained_linear_model, synthetic_loader,
                                seed=0, compile=False, show_progress=False)
-        assert llc.shape == (chains,)
+        assert llc.shape == t.Size([])
         assert llc.dtype == t.float32
+        assert est.get_metrics()["llcs"].shape == (chains,)
 
     def test_array_log_l_shape(self, trained_linear_model, synthetic_loader):
         draws, chains = 10, 3
@@ -137,7 +138,7 @@ class TestLLCProperties:
             )
             llc = est.estimate_llc(trained_linear_model, synthetic_loader,
                                    seed=42, compile=False, show_progress=False)
-            llcs[loc] = llc.mean().item()
+            llcs[loc] = llc.item()
         assert llcs[1000.0] < llcs[1.0], (
             f"Higher localization should give lower LLC: "
             f"loc=1 -> {llcs[1.0]:.4f}, loc=1000 -> {llcs[1000.0]:.4f}"
@@ -153,7 +154,7 @@ class TestLLCProperties:
             )
             llc = est.estimate_llc(trained_linear_model, synthetic_loader,
                                    seed=42, compile=False, show_progress=False)
-            variances[draws] = llc.var().item()
+            variances[draws] = est.get_metrics()["llcs"].var().item()
         assert variances[50] < variances[5], (
             f"More draws should reduce variance: "
             f"5 draws var={variances[5]:.6f}, 50 draws var={variances[50]:.6f}"
@@ -212,8 +213,8 @@ class TestCustomCallbacks:
         )
         llc = est.estimate_llc(model, regression_loader, criterion_fn=mse,
                                seed=42, compile=False, show_progress=False)
-        assert t.isfinite(llc).all()
-        assert llc.shape == (2,)
+        assert t.isfinite(llc)
+        assert est.get_metrics()["llcs"].shape == (2,)
 
     def test_custom_unpack_fn(self, synthetic_loader):
         """Custom unpack function should be called to extract (x, y)."""
@@ -235,8 +236,8 @@ class TestCustomCallbacks:
         )
         llc = est.estimate_llc(model, loader, unpack_fn=unpack,
                                seed=42, compile=False, show_progress=False)
-        assert llc.shape == (1,)
-        assert t.isfinite(llc).all()
+        assert est.get_metrics()["llcs"].shape == (1,)
+        assert t.isfinite(llc)
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +253,7 @@ class TestCompileFlag:
         )
         llc = est.estimate_llc(trained_linear_model, synthetic_loader,
                                seed=42, compile=False, show_progress=False)
-        assert t.isfinite(llc).all()
+        assert t.isfinite(llc)
 
     def test_compile_true_runs(self, trained_linear_model, synthetic_loader):
         est = LLCEstimator(
@@ -261,7 +262,7 @@ class TestCompileFlag:
         )
         llc = est.estimate_llc(trained_linear_model, synthetic_loader,
                                seed=42, compile=True, show_progress=False)
-        assert t.isfinite(llc).all()
+        assert t.isfinite(llc)
 
 
 # ---------------------------------------------------------------------------
@@ -281,8 +282,8 @@ class TestChainBatching:
             chain_batch=2, devices=["cpu", "cpu"],
             seed=42, compile=False, show_progress=False,
         )
-        assert llc.shape == (4,)
-        assert t.isfinite(llc).all()
+        assert est.get_metrics()["llcs"].shape == (4,)
+        assert t.isfinite(llc)
 
     def test_chain_batch_all_same_as_explicit(self, trained_linear_model, synthetic_loader):
         """chain_batch='all' and chain_batch=chains should give same result."""
@@ -317,8 +318,8 @@ class TestGradAccumulation:
         )
         llc = est.estimate_llc(trained_linear_model, synthetic_loader,
                                seed=42, compile=False, show_progress=False)
-        assert t.isfinite(llc).all()
-        assert llc.shape == (1,)
+        assert t.isfinite(llc)
+        assert est.get_metrics()["llcs"].shape == (1,)
 
 
 # ---------------------------------------------------------------------------
@@ -354,8 +355,8 @@ class TestEdgeCases:
         )
         llc = est.estimate_llc(trained_linear_model, synthetic_loader,
                                seed=0, compile=False, show_progress=False)
-        assert llc.shape == (1,)
-        assert t.isfinite(llc).all()
+        assert est.get_metrics()["llcs"].shape == (1,)
+        assert t.isfinite(llc)
 
     def test_single_draw(self, trained_linear_model, synthetic_loader):
         est = LLCEstimator(
@@ -364,8 +365,8 @@ class TestEdgeCases:
         )
         llc = est.estimate_llc(trained_linear_model, synthetic_loader,
                                seed=0, compile=False, show_progress=False)
-        assert llc.shape == (2,)
-        assert t.isfinite(llc).all()
+        assert est.get_metrics()["llcs"].shape == (2,)
+        assert t.isfinite(llc)
 
     def test_no_seed_runs(self, trained_linear_model, synthetic_loader):
         """seed=None should still work (non-deterministic)."""
@@ -375,7 +376,7 @@ class TestEdgeCases:
         )
         llc = est.estimate_llc(trained_linear_model, synthetic_loader,
                                seed=None, compile=False, show_progress=False)
-        assert t.isfinite(llc).all()
+        assert t.isfinite(llc)
 
     def test_reuse_estimator(self, trained_linear_model, synthetic_loader):
         """Calling estimate_llc twice on the same estimator should work."""
@@ -388,8 +389,8 @@ class TestEdgeCases:
         llc2 = est.estimate_llc(trained_linear_model, synthetic_loader,
                                 seed=99, compile=False, show_progress=False)
         # Both should be valid
-        assert t.isfinite(llc1).all()
-        assert t.isfinite(llc2).all()
+        assert t.isfinite(llc1)
+        assert t.isfinite(llc2)
         # Internal state should reflect the second run
         assert est.array_log_l.shape == (2, 5)
 
@@ -407,9 +408,10 @@ class TestDifferentModels:
         )
         llc = est.estimate_llc(trained_mlp, synthetic_loader,
                                seed=42, compile=False, show_progress=False)
-        assert llc.shape == (2,)
-        assert t.isfinite(llc).all()
-        assert (llc > 0).all()
+        metrics = est.get_metrics()
+        assert metrics["llcs"].shape == (2,)
+        assert t.isfinite(llc)
+        assert (metrics["llcs"] > 0).all()
 
     def test_untrained_model(self, synthetic_loader):
         """An untrained model should still produce finite LLC (may not be positive)."""
@@ -421,7 +423,7 @@ class TestDifferentModels:
         )
         llc = est.estimate_llc(model, synthetic_loader,
                                seed=42, compile=False, show_progress=False)
-        assert t.isfinite(llc).all()
+        assert t.isfinite(llc)
 
 
 # ---------------------------------------------------------------------------
@@ -460,7 +462,7 @@ class TestKnownRLCT:
             )
             llc = est.estimate_llc(model, loader, criterion_fn=monomial_loss,
                                    seed=42, compile=False, show_progress=False)
-            rlcts.append(llc.mean().item())
+            rlcts.append(llc.item())
 
         # RLCT should decrease: 1/2 > 1/4 > 1/6
         assert rlcts[0] > rlcts[1] > rlcts[2], (
@@ -492,6 +494,6 @@ class TestKnownRLCT:
         )
         llc = est.estimate_llc(model, loader, criterion_fn=monomial_loss,
                                seed=42, compile=False, show_progress=False)
-        mean_llc = llc.mean().item()
+        mean_llc = llc.item()
         # Should be within 3x of 0.5
         assert 0.15 < mean_llc < 1.5, f"Expected ~0.5, got {mean_llc:.4f}"
