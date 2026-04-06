@@ -193,7 +193,7 @@ class LLCEstimator:
 
         num_chains = len(chain_idxs)
 
-        moved_model = model.to(device=device)
+        moved_model = model.to(device)
         models = [deepcopy(moved_model) for _ in range(num_chains)]
         params, buffers = stack_module_state(models)
         del models
@@ -273,7 +273,7 @@ class LLCEstimator:
             pbar.update(1)
 
         # draw steps
-        cumulative_loss = t.zeros((num_chains), device=device)
+        cumulative_loss = t.zeros((num_chains), device=device, requires_grad=False)
         for draw_no in range(self.draws):
             for between_draw_count in range(self.steps_bw_draws):
                 accumulated_grads = None
@@ -289,7 +289,9 @@ class LLCEstimator:
                     )
 
                     if is_draw:
-                        cumulative_loss += losses / self.grad_accumulation_steps
+                        cumulative_loss.add_(
+                            losses.detach() / self.grad_accumulation_steps
+                        )
 
                 # optimzer step
                 assert accumulated_grads is not None, "No gradients were accumulated!"
