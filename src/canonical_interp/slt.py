@@ -221,8 +221,7 @@ class LLCEstimator:
             randomness="different",
         )
 
-        if compile:
-            all_grad_fn = t.compile(all_grad_fn)
+        all_grad_fn = t.compile(all_grad_fn, disable=not compile)
 
         original_loss = t.zeros((num_chains), device=device)
         for batch in train_dataloader:
@@ -306,7 +305,6 @@ class LLCEstimator:
 
                 pbar.update(self.grad_accumulation_steps)
 
-            # TODO callback system
             self.array_log_l[chain_idxs, draw_no] = cumulative_loss.cpu()
             cumulative_loss.zero_()
 
@@ -322,7 +320,6 @@ class LLCEstimator:
         seed=None,
         compile: bool = True,
         unpack_fn: Callable[..., Tuple[t.Tensor, t.Tensor]] | None = None,
-        cuda_alloc_conf: str | None = "expandable_segments:True",
         show_progress: bool = True,
     ):
         """Run SGLD sampling and return per-chain LLC estimates.
@@ -347,12 +344,6 @@ class LLCEstimator:
                 ``lambda batch: (batch[0], batch[1])``.  Device movement is
                 handled internally; this function should only extract and
                 preprocess data.
-            cuda_alloc_conf: Configuration string passed to
-                ``torch.cuda.memory._set_allocator_settings`` before sampling
-                on any CUDA device.  Defaults to
-                ``"expandable_segments:True"``, which reduces fragmentation
-                when tensor sizes vary across chains and batches.  Set to
-                ``None`` to leave the allocator unchanged.
             show_progress: If True (default), display a tqdm progress bar
                 tracking burn-in and draw steps.  In multi-device runs each
                 thread gets its own bar at a separate terminal position.
@@ -372,11 +363,6 @@ class LLCEstimator:
             rng = t.Generator()
             rng.manual_seed(seed)
             seeds = t.randint(0, 2**31, (num_chain_batches,), generator=rng).tolist()
-
-        # This causes weird incompatibility, commenting out for now
-        # cuda_devices = [d for d in device_list if d.type == "cuda"]
-        # if cuda_devices and cuda_alloc_conf is not None:
-        #     t._C._accelerator_setAllocatorSettings(cuda_alloc_conf)
 
         if len(device_list) > num_chain_batches:
             logger.warning(
