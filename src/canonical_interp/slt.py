@@ -428,9 +428,10 @@ class LLCEstimator:
                 map(list, batched(range(self.chains), chain_batch)), cycle(device_list)
             )  # (chain_idxs, t.device)
 
+            futures = {}
             with ThreadPoolExecutor(max_workers=len(device_list)) as executor:
                 for thread_idx, (chain_idxs, device) in enumerate(chains_device_iter):
-                    executor.submit(
+                    future = executor.submit(
                         lambda idxs, device, t_idx=thread_idx, s=seeds[
                             thread_idx
                         ]: partial_chain_call(
@@ -439,6 +440,23 @@ class LLCEstimator:
                         chain_idxs,
                         device,
                     )
+                    futures[thread_idx] = future
+
+            first_exc = None
+            first_exc_thread = None
+            for thread_idx, future in futures.items():
+                exc = future.exception()
+                if exc is not None:
+                    logger.warning(
+                        f"Exception in thread {thread_idx}: {exc}"
+                    )
+                    if first_exc is None:
+                        first_exc = exc
+                        first_exc_thread = thread_idx
+            if first_exc is not None:
+                raise RuntimeError(
+                    f"Exception raised in thread {first_exc_thread}"
+                ) from first_exc
 
         avg_sampled_loss = t.mean(self.array_log_l, dim=-1)
         llcs = self.nbeta * (avg_sampled_loss - self.original_loss)
