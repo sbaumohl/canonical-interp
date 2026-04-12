@@ -57,6 +57,7 @@ class LLCGridSearch:
         compile: bool = True,
         unpack_fn: Callable[..., Tuple[t.Tensor, t.Tensor]] | None = None,
         show_progress: bool = True,
+        preferred_dtype: t.dtype = t.float32,
     ) -> pd.DataFrame:
         epsilons = self._expand_param(self.cfg.epsilon, self.cfg.estimates_per_dim)
         gammas = self._expand_param(self.cfg.gamma, self.cfg.estimates_per_dim)
@@ -74,6 +75,7 @@ class LLCGridSearch:
                 learning_rate=eps,
                 localization=gam,
                 nbeta=nb,
+                dtype=preferred_dtype,
             )
             estimator.estimate_llc(
                 model=model,
