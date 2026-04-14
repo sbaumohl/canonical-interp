@@ -12,6 +12,7 @@ def sgld_step(
     nbeta: float = 1.0,
     localization: float = 0.0,
     noise_level: float = 1.0,
+    targeted_params: frozenset[str] | None = None,
 ):
     """Perform a single Stochastic Gradient Langevin Dynamics (SGLD) update step in-place.
 
@@ -48,8 +49,16 @@ def sgld_step(
             parameters back toward ``initial_weights``.  Set to 0 to disable.
         noise_level: Standard deviation multiplier for the injected Gaussian
             noise (default 1.0).
+        targeted_params: Optional frozenset of parameter names to update. If
+            ``None`` (default), all parameters in ``params`` are updated.
+            Parameters not in this set are left unchanged. A frozenset is
+            used instead of a list so ``torch.compile`` can cache on it
+            without retracing.
     """
     for name, p in params.items():
+        if targeted_params is not None and name not in targeted_params:
+            continue
+
         delta_weights = (grads[name] / grad_accumulation_steps) * nbeta
 
         if localization > 0.0:

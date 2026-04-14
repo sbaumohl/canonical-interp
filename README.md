@@ -22,7 +22,7 @@ pip install canonical-interp
 uv add canonical-interp
 ```
 
-Requires Python ≥ 3.10 and PyTorch ≥ 2.11.
+Requires Python ≥ 3.12 and PyTorch ≥ 2.8.
 
 ## Quick start
 

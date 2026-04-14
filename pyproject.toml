@@ -3,12 +3,11 @@ name = "canonical-interp"
 version = "0.1.4"
 description = "Efficient tooling for Developmental Interpretability"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.2.6",
     "pandas>=2.3.3",
-    "torch>=2.11.0",
-    "torchvision>=0.26.0",
+    "torch>=2.8.0",
     "tqdm>=4.67.3",
 ]
 license = "MIT"

@@ -1,3 +1,4 @@
+from canonical_interp import nbeta_from_effective_size
 import tqdm
 from concurrent.futures import ThreadPoolExecutor
 import math
@@ -52,12 +53,12 @@ class LLCEstimator:
         draws: int,
         chains: int,
         burnin_steps: int,
-        steps_bw_draws: int,
+        steps_bw_draws: int = 1,
         grad_accumulation_steps: int = 1,
         verbose: bool = False,
-        learning_rate: float | int = 1.0,  # epsilon
-        localization: float | int = 1.0,  # gamma
-        nbeta: float | int = 4.0,
+        learning_rate: float | int = 0.001,  # epsilon
+        localization: float | int = 5.0,  # gamma
+        nbeta: float | int = nbeta_from_effective_size(32),
         dtype: t.dtype = t.float32,
     ):
         self.draws: int = draws
@@ -81,7 +82,7 @@ class LLCEstimator:
                 "Designated fewer burn-in steps than draws. It is recommended to increase burn-in steps until we reach a loss plateau."
             )
 
-        if 1.0 < self.localization < 10.0:
+        if not (1.0 < self.localization < 10.0):
             logger.warning(
                 f"Localization term is {self.localization}. It is recommended to avoid extreme localization parameters. Try lowering epsilon or increasing draws or burn-in steps."
             )
@@ -148,6 +149,9 @@ class LLCEstimator:
     def get_metrics(self) -> dict[str, t.Tensor] | None:
         return self._metrics
 
+    def clear_metrics(self):
+        self._metrics = dict()
+
     def _estimate_llc(
         self,
         model: nn.Module,
@@ -163,6 +167,7 @@ class LLCEstimator:
         show_progress: bool = True,
         seed=None,
         compile: bool = True,
+        targeted_params: frozenset[str] | None = None,
     ):
         """Run a batch of SGLD chains on a single device and record loss draws.
 
@@ -187,6 +192,9 @@ class LLCEstimator:
             seed: Optional RNG seed for reproducibility on this device.
             compile: If True, JIT-compile the vmapped grad function with
                 ``torch.compile``.
+            targeted_params: Optional frozenset of validated parameter names
+                to restrict SGLD updates to. Passed through to
+                :func:`~canonical_interp.optim.sgld_step`.
         """
         if seed is not None:
             t.manual_seed(seed)
@@ -268,6 +276,7 @@ class LLCEstimator:
                     learning_rate=self.learning_rate,
                     nbeta=self.nbeta,
                     localization=self.localization,
+                    targeted_params=targeted_params,
                 )
                 accumulated_grads = None
             pbar.update(1)
@@ -303,6 +312,7 @@ class LLCEstimator:
                     learning_rate=self.learning_rate,
                     nbeta=self.nbeta,
                     localization=self.localization,
+                    targeted_params=targeted_params,
                 )
 
                 pbar.update(self.grad_accumulation_steps)
@@ -323,6 +333,7 @@ class LLCEstimator:
         compile: bool = True,
         unpack_fn: Callable[..., Tuple[t.Tensor, t.Tensor]] | None = None,
         show_progress: bool = True,
+        targeted_params: list[str] | None = None,
     ):
         """Run SGLD sampling and return per-chain LLC estimates.
 
@@ -349,6 +360,11 @@ class LLCEstimator:
             show_progress: If True (default), display a tqdm progress bar
                 tracking burn-in and draw steps.  In multi-device runs each
                 thread gets its own bar at a separate terminal position.
+            targeted_params: Optional list of parameter names to restrict
+                SGLD sampling to. Only these parameters will be updated
+                during sampling; all others are frozen. If ``None``
+                (default), all model parameters are updated. Names must
+                match those returned by ``model.named_parameters()``.
 
         Returns:
             Tensor of shape ``(chains,)`` with per-chain LLC estimates.
@@ -396,6 +412,25 @@ class LLCEstimator:
         self.array_log_l = t.zeros((self.chains, self.draws))
         self.original_loss = t.zeros((self.chains,))
 
+        filtered_param_targets: frozenset[str] | None = None
+        if targeted_params is not None and len(targeted_params) == 0:
+            logger.error("`targeted_params` has no listed parameters. Exiting...")
+            return
+        elif targeted_params is not None:
+            targets = set(targeted_params)
+            model_names = {name for name, _ in model.named_parameters(recurse=True)}
+            matched = targets & model_names
+            missing = targets - model_names
+            if len(matched) == 0:
+                logger.error(
+                    "`targeted_params` has no parameters that exist in `model`! Exiting..."
+                )
+                return
+
+            if len(missing) > 0:
+                logger.warning(f"Parameters {missing} not found in `model`!")
+            filtered_param_targets = frozenset(matched)
+
         # prep backward/forward pass
         forward_pass = LLCEstimator._construct_forward_pass(criterion_fn)
         if unpack_fn is None:
@@ -412,6 +447,7 @@ class LLCEstimator:
                 seed=seeds[0],
                 compile=compile,
                 show_progress=show_progress,
+                targeted_params=filtered_param_targets,
             )
         else:
             partial_chain_call = partial(
@@ -422,6 +458,7 @@ class LLCEstimator:
                 unpack_fn,
                 compile=compile,
                 show_progress=show_progress,
+                targeted_params=filtered_param_targets,
             )
 
             chains_device_iter = zip(
@@ -447,9 +484,7 @@ class LLCEstimator:
             for thread_idx, future in futures.items():
                 exc = future.exception()
                 if exc is not None:
-                    logger.warning(
-                        f"Exception in thread {thread_idx}: {exc}"
-                    )
+                    logger.warning(f"Exception in thread {thread_idx}: {exc}")
                     if first_exc is None:
                         first_exc = exc
                         first_exc_thread = thread_idx
