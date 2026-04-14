@@ -1,4 +1,4 @@
-from canonical_interp import nbeta_from_effective_size
+from canonical_interp.utils import nbeta_from_effective_size
 import tqdm
 from concurrent.futures import ThreadPoolExecutor
 import math
