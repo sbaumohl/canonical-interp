@@ -166,7 +166,7 @@ class LLCEstimator:
         thread_idx: int | None = None,
         show_progress: bool = True,
         seed=None,
-        compile: bool = True,
+        compile: bool | str = "reduce-overhead",
         targeted_params: frozenset[str] | None = None,
     ):
         """Run a batch of SGLD chains on a single device and record loss draws.
@@ -190,8 +190,9 @@ class LLCEstimator:
                 for single-batch runs.
             show_progress: If True, display a tqdm progress bar.
             seed: Optional RNG seed for reproducibility on this device.
-            compile: If True, JIT-compile the vmapped grad function with
-                ``torch.compile``.
+            compile: Controls ``torch.compile`` for the vmapped grad function.
+                A mode string (e.g. ``"reduce-overhead"``) enables that mode;
+                ``True`` uses the default mode; ``False`` disables compilation.
             targeted_params: Optional frozenset of validated parameter names
                 to restrict SGLD updates to. Passed through to
                 :func:`~canonical_interp.optim.sgld_step`.
@@ -229,7 +230,9 @@ class LLCEstimator:
             randomness="different",
         )
 
-        all_grad_fn = t.compile(all_grad_fn, disable=not compile)
+        if compile:
+            all_grad_fn = t.compile(all_grad_fn, mode=compile if isinstance(compile, str) else None)
+
 
         original_loss = t.zeros((num_chains), device=device)
         for batch in train_dataloader:
@@ -282,6 +285,7 @@ class LLCEstimator:
             pbar.update(1)
 
         # draw steps
+        local_log_l = t.zeros((num_chains, self.draws), device=device)
         cumulative_loss = t.zeros((num_chains), device=device, requires_grad=False)
         for draw_no in range(self.draws):
             for between_draw_count in range(self.steps_bw_draws):
@@ -317,8 +321,10 @@ class LLCEstimator:
 
                 pbar.update(self.grad_accumulation_steps)
 
-            self.array_log_l[chain_idxs, draw_no] = cumulative_loss.cpu()
+            local_log_l[:, draw_no] = cumulative_loss
             cumulative_loss.zero_()
+
+        self.array_log_l[chain_idxs] = local_log_l.cpu()
 
         pbar.close()
 
@@ -330,7 +336,7 @@ class LLCEstimator:
         chain_batch: int | Literal["all"] = "all",
         devices: list[str | t.device] | str | t.device = t.device("cpu"),
         seed=None,
-        compile: bool = True,
+        compile: bool | str = "reduce-overhead",
         unpack_fn: Callable[..., Tuple[t.Tensor, t.Tensor]] | None = None,
         show_progress: bool = True,
         targeted_params: list[str] | None = None,
@@ -350,8 +356,12 @@ class LLCEstimator:
                 ignored with a warning.
             seed: Optional integer seed for reproducible sampling.  Derived
                 per-call seeds are generated from this master seed.
-            compile: If True (default), JIT-compile the vmapped grad function
-                with ``torch.compile`` for faster sampling.
+            compile: Controls ``torch.compile`` for the vmapped grad function.
+                Pass a mode string (default ``"reduce-overhead"``) to enable
+                compilation with that mode, ``True`` for the default torch
+                compile mode, or ``False`` to disable compilation entirely.
+                If ``"reduce-overhead"`` causes issues, try ``"default"`` or
+                ``True`` as a safer fallback.
             unpack_fn: Optional function ``(batch) -> (x, y)`` to extract
                 inputs and targets from a raw dataloader batch.  Defaults to
                 ``lambda batch: (batch[0], batch[1])``.  Device movement is

@@ -1,6 +1,7 @@
 """Unit tests for LLCEstimator internals."""
 
 import pytest
+import numpy as np
 import torch as t
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,9 +33,9 @@ class TestConstructor:
         assert est.steps_bw_draws == 1
         assert est.grad_accumulation_steps == 1
         assert est.verbose is False
-        assert est.learning_rate == 1.0
-        assert est.localization == 1.0
-        assert est.nbeta == 4.0
+        assert est.learning_rate == 0.001
+        assert est.localization == 5.0
+        assert est.nbeta == pytest.approx(32 / np.log(32))
         assert est.preferred_dtype == t.float32
 
     def test_custom_values(self):
