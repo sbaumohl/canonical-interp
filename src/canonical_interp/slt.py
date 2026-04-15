@@ -231,16 +231,22 @@ class LLCEstimator:
         )
 
         if compile:
-            all_grad_fn = t.compile(all_grad_fn, mode=compile if isinstance(compile, str) else None)
+            all_grad_fn = t.compile(
+                all_grad_fn, mode=compile if isinstance(compile, str) else None
+            )
 
-
-        original_loss = t.zeros((num_chains), device=device)
-        for batch in train_dataloader:
-            x, y = unpack_fn(batch)
-            x, y = x.to(device=device), y.to(device=device)
-            _, loss = all_grad_fn(model, params, buffers, x, y)
-            original_loss += loss
-        original_loss /= len(train_dataloader)
+        all_loss_fn = vmap(
+            partial(forward_pass, model),
+            in_dims=(0, 0, None, None),
+            randomness="different",
+        )
+        with t.no_grad():
+            original_loss = t.zeros((num_chains), device=device)
+            for batch in train_dataloader:
+                x, y = unpack_fn(batch)
+                x, y = x.to(device=device), y.to(device=device)
+                original_loss += all_loss_fn(params, buffers, x, y)
+            original_loss /= len(train_dataloader)
         self.original_loss[chain_idxs] = original_loss.cpu()
 
         initial_params = {name: p[0].clone() for name, p in params.items()}
