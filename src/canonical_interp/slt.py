@@ -76,6 +76,7 @@ class LLCEstimator:
 
         # internal state for holding mid-run llc data
         self._metrics = dict()
+        self._original_loss = None
 
         if self.burnin_steps < self.draws:
             logger.warning(
@@ -234,20 +235,6 @@ class LLCEstimator:
             all_grad_fn = t.compile(
                 all_grad_fn, mode=compile if isinstance(compile, str) else None
             )
-
-        all_loss_fn = vmap(
-            partial(forward_pass, model),
-            in_dims=(0, 0, None, None),
-            randomness="different",
-        )
-        with t.no_grad():
-            original_loss = t.zeros((num_chains), device=device)
-            for batch in train_dataloader:
-                x, y = unpack_fn(batch)
-                x, y = x.to(device=device), y.to(device=device)
-                original_loss += all_loss_fn(params, buffers, x, y)
-            original_loss /= len(train_dataloader)
-        self.original_loss[chain_idxs] = original_loss.cpu()
 
         initial_params = {name: p[0].clone() for name, p in params.items()}
 
@@ -425,8 +412,8 @@ class LLCEstimator:
                 "`train_dataloader` has `persistent_workers=False`. With `num_workers > 0`, workers respawn between epochs — set `persistent_workers=True` to avoid repeated startup overhead during SGLD cycling."
             )
 
-        self.array_log_l = t.zeros((self.chains, self.draws))
-        self.original_loss = t.zeros((self.chains,))
+        self.array_log_l = t.zeros((self.chains, self.draws), requires_grad=False)
+        self.original_loss = t.zeros((), requires_grad=False)
 
         filtered_param_targets: frozenset[str] | None = None
         if targeted_params is not None and len(targeted_params) == 0:
@@ -451,6 +438,18 @@ class LLCEstimator:
         forward_pass = LLCEstimator._construct_forward_pass(criterion_fn)
         if unpack_fn is None:
             unpack_fn = lambda batch: (batch[0], batch[1])
+
+        # calculate the original loss for this model (shared across chains)
+        loss_device = device_list[0]
+        model.to(loss_device)
+        with t.no_grad():
+            running = t.zeros((), device=loss_device)
+            for batch in train_dataloader:
+                x, y = unpack_fn(batch)
+                x, y = x.to(device=loss_device), y.to(device=loss_device)
+                running += criterion_fn(model(x), y)
+            running /= len(train_dataloader)
+            self.original_loss = running.detach().cpu()
 
         if num_chain_batches == 1:
             self._estimate_llc(
