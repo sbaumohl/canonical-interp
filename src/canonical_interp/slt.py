@@ -76,7 +76,7 @@ class LLCEstimator:
 
         # internal state for holding mid-run llc data
         self._metrics = dict()
-        self._original_loss = None
+        self.original_loss = None
 
         if self.burnin_steps < self.draws:
             logger.warning(
@@ -333,6 +333,7 @@ class LLCEstimator:
         unpack_fn: Callable[..., Tuple[t.Tensor, t.Tensor]] | None = None,
         show_progress: bool = True,
         targeted_params: list[str] | None = None,
+        current_loss: t.Tensor | float | None = None
     ):
         """Run SGLD sampling and return per-chain LLC estimates.
 
@@ -440,16 +441,22 @@ class LLCEstimator:
             unpack_fn = lambda batch: (batch[0], batch[1])
 
         # calculate the original loss for this model (shared across chains)
-        loss_device = device_list[0]
-        model.to(loss_device)
-        with t.no_grad():
-            running = t.zeros((), device=loss_device)
-            for batch in train_dataloader:
-                x, y = unpack_fn(batch)
-                x, y = x.to(device=loss_device), y.to(device=loss_device)
-                running += criterion_fn(model(x), y)
-            running /= len(train_dataloader)
-            self.original_loss = running.detach().cpu()
+        if current_loss is not None:
+            if isinstance(current_loss, (int, float)):
+                self.original_loss = t.tensor(float(current_loss)).cpu()
+            elif isinstance(current_loss, t.Tensor):
+                self.original_loss = current_loss.detach().clone().cpu()
+        else:
+            loss_device = device_list[0]
+            model.to(loss_device)
+            with t.no_grad():
+                running = t.zeros((), device=loss_device)
+                for batch in train_dataloader:
+                    x, y = unpack_fn(batch)
+                    x, y = x.to(device=loss_device), y.to(device=loss_device)
+                    running += criterion_fn(model(x), y)
+                running /= len(train_dataloader)
+                self.original_loss = running.detach().cpu()
 
         if num_chain_batches == 1:
             self._estimate_llc(

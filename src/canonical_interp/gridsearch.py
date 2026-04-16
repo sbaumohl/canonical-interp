@@ -64,6 +64,7 @@ class LLCGridSearch:
         nbetas = self._expand_param(self.cfg.nbeta, self.cfg.estimates_per_dim)
 
         rows = []
+        original_loss = None
         for eps, gam, nb in product(epsilons, gammas, nbetas):
             logger.info(f"Running LLC estimate: epsilon={eps}, gamma={gam}, nbeta={nb}")
             estimator = LLCEstimator(
@@ -87,7 +88,12 @@ class LLCGridSearch:
                 compile=compile,
                 unpack_fn=unpack_fn,
                 show_progress=show_progress,
+                current_loss=original_loss,
             )
+
+            if original_loss is None and estimator.original_loss is not None:
+                original_loss = estimator.original_loss
+
             metrics = estimator.get_metrics()
             rows.append(
                 dict(
