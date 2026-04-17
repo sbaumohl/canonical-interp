@@ -92,9 +92,9 @@ class LLCEstimator:
     def _accumulate_grad(
         current: dict[str, t.Tensor] | None, new: dict[str, t.Tensor]
     ) -> dict[str, t.Tensor]:
-        """Add micro-batch gradients into a running sum. Returns a new dict if current is None."""
+        """Add micro-batch gradients into a running sum. On the first call the returned dict aliases ``new``; subsequent ``.add_()`` calls mutate it in place."""
         if current is None:
-            return {name: g.clone() for name, g in new.items()}
+            return new
         for name in new.keys():
             current[name].add_(new[name])
         return current
@@ -333,7 +333,7 @@ class LLCEstimator:
         unpack_fn: Callable[..., Tuple[t.Tensor, t.Tensor]] | None = None,
         show_progress: bool = True,
         targeted_params: list[str] | None = None,
-        current_loss: t.Tensor | float | None = None
+        current_loss: t.Tensor | float | None = None,
     ):
         """Run SGLD sampling and return per-chain LLC estimates.
 
@@ -451,7 +451,9 @@ class LLCEstimator:
             model.to(loss_device)
             with t.no_grad():
                 running = t.zeros((), device=loss_device)
-                for batch in train_dataloader:
+                for batch in tqdm.tqdm(
+                    train_dataloader, desc="Computing original loss on dataset..."
+                ):
                     x, y = unpack_fn(batch)
                     x, y = x.to(device=loss_device), y.to(device=loss_device)
                     running += criterion_fn(model(x), y)
